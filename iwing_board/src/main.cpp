@@ -197,7 +197,8 @@ bool test_sdcard() {
     } else {
       debug_serial.println("No CONFIG.TXT found");
     }
-
+    config_file.close();
+    root.close();
     return true;
 }
 
@@ -205,6 +206,13 @@ bool test_sdcard() {
 // CHANGED: createFile()
 //***********************************************************
 void createFile() {
+    if (!card.init(SPI_HALF_SPEED, PIN_SD_SS)) {
+        debug_serial.println("initialization failed. Check wiring and card.");
+        return false;
+    } else {
+        debug_serial.println("Card is present.");
+    }
+
      if (!volume.init(card)) {
         debug_serial.println("Could not find FAT16/FAT32 partition.");
         return false;
@@ -247,6 +255,8 @@ void createFile() {
     // sample CSV header
     myFile.println("Time,AccelX,AccelY,AccelZ,GyroX,GyroY,GyroZ,MagX,MagY,MagZ");
     myFile.close();
+
+    root.close();
 }
 
 //***********************************************************
@@ -272,6 +282,8 @@ void writeFile(const char *fileName, const char *data) {
     myFile.close();
     debug_serial.print("[writeFile] Write complete to ");
     debug_serial.println(fileName);
+
+    root.close();
 }
 
 //***********************************************************
@@ -406,8 +418,6 @@ void setup() {
     gnss_serial.begin(9600);
     SPI.swap(SPI1_SWAP_DEFAULT);
 
-    // RTC
-    initRTC();
 
     // SD
     SD.begin(PIN_SD_SS);
@@ -420,6 +430,9 @@ void setup() {
 
     // Create a new data file
     createFile();
+
+    // RTC
+    initRTC();
 
     // Power GNSS on (active-low)
     digitalWrite(PIN_EN_GNSS, LOW);

@@ -256,7 +256,7 @@ void init_imu() {
 /************************************************************
  *
  */
-void setup1() {
+void setup() {
     pullup_all_pins();
     init_gpio();
     debug_serial.begin(115200);
@@ -290,7 +290,7 @@ void loop1() {
 /************************************************************
  *
  */
-void loop2() {
+void loop() {
     float x, y, z;
     int temp;
 
