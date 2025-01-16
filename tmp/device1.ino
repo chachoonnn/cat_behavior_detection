@@ -75,7 +75,7 @@ void setup() {
 void loop() {
   unsigned long timeStamp = millis();
   char timeString[20];
-  
+
   // Get the current timestamp
   if (rtc.begin() && rtc.initialized()) {
     DateTime now = rtc.now();
