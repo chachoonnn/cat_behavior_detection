@@ -3,10 +3,14 @@
 #include <SPI.h>
 #include <SD.h>
 #include <avr/sleep.h>
+#include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
 #include <util/atomic.h>
+
 #include <Arduino_LSM6DSOX.h>
+#include <TinyGPS++.h>
+#include <RTClib.h>
 
 #define PIN_SD_SS     PIN_PC3
 #define PIN_RF_SS     PIN_PD0
@@ -28,14 +32,12 @@
 
 #define PIN_BAT_PROBE PIN_PD7
 
-#define SHORT_BLINK()  do { digitalWrite(PIN_LED1, HIGH); delay(10); digitalWrite(PIN_LED1, LOW); } while (0);
+#define SHORT_BLINK1()  do { digitalWrite(PIN_LED1, HIGH); delay(10); digitalWrite(PIN_LED1, LOW); } while (0);
+#define SHORT_BLINK2()  do { digitalWrite(PIN_LED2, HIGH); delay(10); digitalWrite(PIN_LED1, LOW); } while (0);
+
 
 #define debug_serial Serial
 #define gnss_serial Serial2
-
-Sd2Card card;
-SdVolume volume;
-SdFile root;
 
 /************************************************************
  * Enable pull-up on all pins to lower power
@@ -73,16 +75,19 @@ void init_gpio() {
 }
 
 /************************************************************
- *
+ *      SD 
  */
+
+Sd2Card card;
+SdVolume volume;
+SdFile root;
+SdFile myFile;
+
 void init_card() {
   SdVolume volume;
   card.init(SPI_HALF_SPEED, PIN_SD_SS);
 }
 
-/*******************************
- *
- */
 char* read_line(SdFile& file, char* buf, uint8_t maxlen) {
   uint8_t pos = 0;
 
@@ -101,9 +106,6 @@ char* read_line(SdFile& file, char* buf, uint8_t maxlen) {
   return buf;
 }
 
-/************************************************************
- *
- */
 bool test_sdcard() {
     debug_serial.print("\nInitializing SD card...");
     digitalWrite(PIN_EN_SD, LOW);
@@ -196,26 +198,157 @@ bool test_sdcard() {
     digitalWrite(PIN_EN_SD, HIGH);
 }
 
+SdFile myFile;
+char fileName[15];
+
+void createFile() {
+    if (!root.openRoot(volume)) {
+        Serial.println("Failed to open root directory.");
+        fileName = "data_1.txt" 
+    }
+
+    int fileIndex = 1;
+
+    while (true) {
+        sprintf(fileName, "data_%d.txt", fileIndex);
+        
+        SdFile tempFile;
+        if (!tempFile.open(&root, fileName, O_READ)) {
+            break;
+        }
+        
+        tempFile.close();
+        fileIndex++; 
+    }
+
+    if ( !myFile.open( fileName, O_CREAT | O_WRITE | O_TRUNC)) {
+        Serial.print("Error opening file: ");
+        Serial.println(fileName);
+        return;
+    }
+
+    debug_serial.print( 'Create new file: ' ); debug_serial.println( fileName )
+    myFile.println( "Time,AccelX,AccelY,AccelZ,GyroX,GyroY,GyroZ,MagX,MagY,MagZ,UtcTime,Latitude,Longitude" );
+    myFile.close();
+}
+
+void writeFile(const char *fileName, const char *data) {
+    if (!root.openRoot(volume)) {
+        debug_serial.println("Failed to open root directory.");
+        return;
+    }
+
+    if (!myFile.open(&root, fileName, O_CREAT | O_WRITE | O_TRUNC)) {
+        debug_serial.print("Error opening file: ");
+        debug_serial.println(fileName);
+        return;
+    }
+
+    myFile.print(data);
+    myFile.close();      
+    debug_serial.println("Write complete!");
+}
+
+
 /************************************************************
- *
+ *  IMU handling
  */
+
 void init_imu() {
     if (!IMU.begin()) {
-        Serial.println("Failed to initialize IMU!");
-
+        debug_serial.println("Failed to initialize IMU!");
+        SHORT_BLINK1();
         while (1);
     }
 
-    Serial.print("Accelerometer sample rate = ");
-    Serial.print(IMU.accelerationSampleRate());
-    Serial.println(" Hz");
-    Serial.println();
-    Serial.println("Acceleration in g's");
-    Serial.println("X\tY\tZ");
+    debug_serial.print("Accelerometer sample rate = ");
+    debug_serial.print(IMU.accelerationSampleRate());
+    debug_serial.println(" Hz");
+    debug_serial.println();
+    debug_serial.println("Acceleration in g's");
+    debug_serial.println("X\tY\tZ");
+}
+
+String get_imu_data() {
+    String imuData = ',';
+
+    float ac_x = 0.0, ac_y = 0.0, ac_z = 0.0;
+    float gy_x = 0.0, gy_y = 0.0, gy_z = 0.0;
+
+    if (IMU.accelerationAvailable()) {
+        IMU.readAcceleration(ac_x, ac_y, ac_z);
+
+        debug_serial.print("Accel: ");
+        debug_serial.print(ac_x); debug_serial.print(", ");
+        debug_serial.print(ac_y); debug_serial.print(", ");
+        debug_serial.println(ac_z);
+    }
+    if (IMU.gyroscopeAvailable()) {
+        IMU.readGyroscope(gy_x, gy_y, gy_z);
+
+        debug_serial.print("Gyro: ");
+        debug_serial.print(gy_x); debug_serial.print(", ");
+        debug_serial.print(gy_y); debug_serial.print(", ");
+        debug_serial.println(gy_z);
+    }
+    
+    imuData += String(ac_x) + ',' + String(ac_y) + ',' + String(ac_z) + ',' + String(gy_x) + ',' + String(gy_y) + ',' + String(gy_z) + ',,,'; // add 3 more '' for magnatic that obsolete
+    return imuData
 }
 
 /************************************************************
- *
+ *  GPS
+ */
+
+TinyGPSPlus gps;
+
+void get_gps_data() {
+    String gpsData = ',';
+
+    if (gnss_serial.available()) {
+        char c = gnss_serial.read();
+        gps.encode(c); // Feed data into TinyGPS++
+
+        if (gps.time.isUpdated()) {
+            debug_serial.print("UTC Time: ");
+            debug_serial.print(gps.time.hour());
+            debug_serial.print(":");
+            debug_serial.print(gps.time.minute());
+            debug_serial.print(":");
+            debug_serial.print(gps.time.second());
+            gpsData += String(gps.time.hour()) + ':' + String(gps.time.minute()) + ':' + String(gps.time.second()) + ',';
+        }
+        else {
+            debug_serial.print( "can't find Time" );
+            gpsData += ',';
+        }
+        debug_serial.println();
+
+        if (gps.location.isUpdated()) {
+            debug_serial.print("Latitude: ");
+            debug_serial.print(gps.location.lat(), 6);
+            debug_serial.print("Longitude: ");
+            debug_serial.print(gps.location.lng(), 6);
+            debug_serial.print(", ");
+            gpsData += String(gps.location.lat(), 6) + ',' + String(gps.location.lng(), 6) + ',';
+        }
+        else {
+            debug_serial.print( "can't find location" );
+            debug_serial.print(", ");
+            gpsData += ',,';
+        }
+
+    }
+    else {
+        debug_serial.println( "gnss_serial not available" );
+        gpsData += ',,,'
+    }
+    return gpsData
+}
+
+
+/************************************************************
+ *  main
  */
 void setup() {
     pullup_all_pins();
@@ -231,7 +364,9 @@ void setup() {
     
     init_imu();
 
+    createNewFile();
     test_sdcard();
+
     digitalWrite(PIN_EN_GNSS, LOW);
 }
 
@@ -239,28 +374,12 @@ void setup() {
  *
  */
 void loop() {
-    float x, y, z;
-    int temp;
+    unsigned long timeStamp = millis();
+    char timeString[20];
 
-    if (IMU.gyroscopeAvailable()) {
-        IMU.readGyroscope(x, y, z);
-        Serial.println("Gyroscope");
-        Serial.print(x);
-        Serial.print('\t');
-        Serial.print(y);
-        Serial.print('\t');
-        Serial.println(z);
-    }
-    if (IMU.accelerationAvailable()) {
-        IMU.readAcceleration(x, y, z);
+    get_gps_data();
+    get_imu_data();
 
-        Serial.println("Acceleration");
-        Serial.print(x);
-        Serial.print('\t');
-        Serial.print(y);
-        Serial.print('\t');
-        Serial.println(z);
-    }
     delay(500);
 }
 
