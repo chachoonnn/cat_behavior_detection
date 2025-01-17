@@ -446,12 +446,6 @@ String get_gps_data() {
     String latStr  = "";
     String lonStr  = "";
     double lat = 0, lon = 0;
-    if (gps.time.isUpdated()) {
-        // Format hh:mm:ss
-        char buf[10];
-        sprintf(buf, "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
-        timeStr = String(buf);
-    }
     if (gps.location.isUpdated()) {
         lat = gps.location.lat();
         lon = gps.location.lng();
@@ -464,10 +458,21 @@ String get_gps_data() {
         else {
             debug_serial.println( "OUTSIDE!! geofencing" );
         }
+        if (gps.time.isValid()) {
+            // Format hh:mm:ss
+            char buf[10];
+            sprintf(buf, "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
+            timeStr = String(buf);
+        }
+    }
+    else {
+        debug_serial.print( "gps.location.isValid(): " );     
+        debug_serial.println( gps.location.isValid() );     
     }
 
     // CSV chunk: "GpsTime,lat,lon"
     String gpsData = timeStr + "," + latStr + "," + lonStr;
+    debug_serial.println( gpsData );
     return gpsData;
 }
 
@@ -518,9 +523,11 @@ String getUpTimeMillisString() {
 }
 
 //***********************************************************
-// SETUP
+// GET DATA FROM IMU INTO SD CARD
 //***********************************************************
-void setup() {
+
+// void setup() {
+void setup1() {
     pullup_all_pins();
     init_gpio();
     debug_serial.begin(115200);
@@ -547,35 +554,106 @@ void setup() {
 
     // RTC
     init_RTC();
-
-    // Power GNSS on (active-low)
-    digitalWrite(PIN_EN_GNSS, LOW);
 }
 
-//***********************************************************
-// LOOP
-//***********************************************************
-void loop() {
-    // 1) Acquire GPS data (HH:MM:SS or blank)
-    String gpsData = get_gps_data();
+// void loop() {
+void loop1() {
 
-    // 2) Acquire IMU data (or blank if not available)
+    // 1) Acquire IMU data (or blank if not available)
     String imuData = get_imu_data();
 
-    // 3) Get device uptime in milliseconds (as string)
+    // 2) Get device uptime in milliseconds (as string)
     String uptimeMs = getUpTimeMillisString();
 
-    // 4) Build CSV line (adding 3 empty columns for MagX,MagY,MagZ)
+    // 3) Build CSV line (adding 3 empty columns for MagX,MagY,MagZ)
     String csvLine = uptimeMs + "," + 
                      imuData + "," +
-                     ",,," +   // blank placeholders for Mag
-                     gpsData + "\r\n";
+                     ",," +   // blank placeholders for Mag
+                     "\r\n";
 
-    // 5) Append to file named "data_1.txt" or "data_2.txt", etc.
+    // 4) Append to file named "data_1.txt" or "data_2.txt", etc.
     writeFile(fileName, csvLine.c_str());
 
     debug_serial.print("Data: ");
     debug_serial.println(csvLine);
 
     delay(500);
+}
+
+//***********************************************************
+// READ GPS DATA
+//***********************************************************
+
+void setup() {
+// void setup2() {
+    init_gpio();
+
+    // Start serial for debug
+    debug_serial.begin(115200);
+    delay(1000);
+    debug_serial.println("GPS Starting...");
+
+    // If your board supports Wire.swap(0) or similar, do it if needed
+    // Wire.swap(0);
+    // Wire.begin();
+
+    // Initialize GNSS Serial 
+    // (check your board's docs for the correct pins or usage of Serial2)
+    gnss_serial.begin(9600);
+
+    // Blink once to show we're alive
+    SHORT_BLINK1();
+
+    // Power GNSS on (active-low)
+    digitalWrite(PIN_EN_GNSS, LOW);
+
+    g_enableGeofence = true;
+    g_minLat = 13.0;
+    g_maxLat = 15.0;
+    g_minLng = 99.0;
+    g_maxLng = 101.0;
+}
+
+void loop() {
+// void loop2() {
+    // 1) Continuously read from GNSS serial
+    while (gnss_serial.available()) {
+        char c = gnss_serial.read();
+        gps.encode(c);
+    }
+
+    // 2) If we have a new updated location/time, print it
+    //    (TinyGPS++ sets these flags when a new full NMEA sentence has been parsed)
+    if (gps.location.isUpdated()) {
+        debug_serial.println();
+        double lat = gps.location.lat();
+        double lng = gps.location.lng();
+        debug_serial.print("Lat: ");
+        debug_serial.print(lat, 6);
+        debug_serial.print("  Lon: ");
+        debug_serial.print(lng, 6);
+
+        // Print time if available
+        if (gps.time.isValid()) {
+            debug_serial.print("  Time (UTC): ");
+            debug_serial.print(gps.time.hour());
+            debug_serial.print(":");
+            debug_serial.print(gps.time.minute());
+            debug_serial.print(":");
+            debug_serial.println(gps.time.second());
+        }
+        if (insideSquare( lat, lng )) {
+            // send flag to LoRa gateway
+            debug_serial.println( "Inside geofencing" );
+        }
+        else {
+            debug_serial.println( "OUTSIDE!! geofencing" );
+        }
+
+        // Blink LED2 to indicate we got new data
+        SHORT_BLINK2();
+    }
+
+    // Optional small delay
+    delay(100);
 }
