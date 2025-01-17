@@ -66,15 +66,31 @@ SdFile myFile;
 char linebuf[128];
 char fileName[15];
 
+// For geofence bounding box
+bool g_enableGeofence = false;  // if false => skip geofence check
+double g_minLat = 0.0, g_maxLat = 0.0;
+double g_minLng = 0.0, g_maxLng = 0.0;
+
+// For time zone offset
+int g_timeZoneHours = 0;        // e.g. 7 => +7 hours from UTC
+
+// For storing last known valid GPS time
+bool  g_hasLastGpsTime = false; // have we ever had a valid fix?
+uint8_t g_lastHour = 0, g_lastMinute = 0, g_lastSecond = 0;
+
+// Store how many seconds the RTC has advanced since the last valid GPS time
+// Then we can add that offset to the last known time
+uint32_t g_lastRtcCount = 0;
+
 //***********************************************************
 // Forward declarations
 //***********************************************************
 void pullup_all_pins(void);
 void init_gpio(void);
-bool test_sdcard(void);
-void createFile(void);
+bool init_sdcard(void);
+void create_file(void);
 void writeFile(const char *fileName, const char *data);
-
+bool insideSquare(double lat, double lng);
 
 void init_imu(void);
 String get_imu_data(void);
@@ -83,7 +99,7 @@ TinyGPSPlus gps;
 String get_gps_data(void);
 
 ISR(RTC_CNT_vect);
-void initRTC(void);
+void init_RTC(void);
 String getUpTimeMillisString(void);
 
 //***********************************************************
@@ -134,7 +150,7 @@ char* read_line(SdFile& file, char* buf, uint8_t maxlen) {
   return buf;
 }
 
-bool test_sdcard() {
+bool init_sdcard() {
     debug_serial.print("\nInitializing SD card...");
     digitalWrite(PIN_EN_SD, LOW);
 
@@ -157,55 +173,118 @@ bool test_sdcard() {
         debug_serial.println("Could not find FAT16/FAT32 partition.");
         return false;
     }
-    debug_serial.print("Clusters:          ");
-    debug_serial.println(volume.clusterCount());
-    debug_serial.print("Blocks x Cluster:  ");
-    debug_serial.println(volume.blocksPerCluster());
-    debug_serial.print("Total Blocks:      ");
-    debug_serial.println(volume.blocksPerCluster() * volume.clusterCount());
-    debug_serial.println();
-
-    uint32_t volumesize;
-    debug_serial.print("Volume type is:    FAT");
-    debug_serial.println(volume.fatType(), DEC);
-
-    volumesize = volume.blocksPerCluster();
-    volumesize *= volume.clusterCount();
-    volumesize /= 2; // 512 bytes/block => 2 blocks = 1KB
-    debug_serial.print("Volume size (Kb):  ");
-    debug_serial.println(volumesize);
-    debug_serial.print("Volume size (Mb):  ");
-    volumesize /= 1024;
-    debug_serial.println(volumesize);
-    debug_serial.print("Volume size (Gb):  ");
-    debug_serial.println((float)volumesize / 1024.0);
+    // ... (print volume info, etc.)
 
     if (!root.openRoot(volume)) {
         return false;
     }
-    
-    // Example read from CONFIG.TXT
+
+    // We'll track how many bounding box lines we find
+    bool foundMinLat = false, foundMaxLat = false;
+    bool foundMinLng = false, foundMaxLng = false;
+
     SdFile config_file;
     if (config_file.open(&root, "CONFIG.TXT", O_READ)) {
-      while (true) {
-          char* s = read_line(config_file, linebuf, sizeof(linebuf));
-          if (s == NULL) break;
-          debug_serial.print(s);
-          debug_serial.print("\n");
+        while (true) {
+            char* s = read_line(config_file, linebuf, sizeof(linebuf));
+            if (s == NULL) break; // no more lines
+
+            // Example line: "geof_min_lat   14.0"
+            // or "time_zone   7"
+            // we can parse with sscanf or strncmp
+            /****************************************************************************
+            * Example fix: Use atof() for geofence config lines
+            ****************************************************************************/
+
+            // Inside your config‑reading loop:
+
+            if (strncmp(s, "geof_min_lat", strlen("geof_min_lat")) == 0) {
+                // s might look like: "geof_min_lat 13.0" or "geof_min_lat    13.0"
+                // We'll skip up to "geof_min_lat" plus any whitespace, then parse with atof.
+                char* p = s + strlen("geof_min_lat");  // move pointer just past "geof_min_lat"
+
+                // skip spaces, tabs, or '=' if you have lines like "geof_min_lat = 13.0"
+                while (*p == ' ' || *p == '\t' || *p == '=') {
+                    p++;
+                }
+
+                double val = atof(p); // parse double from the remainder of the line
+                g_minLat = val;
+                foundMinLat = true;
+                debug_serial.print("[CFG] g_minLat = ");
+                debug_serial.println(val, 6);
+            }
+            else if (strncmp(s, "geof_max_lat", strlen("geof_max_lat")) == 0) {
+                char* p = s + strlen("geof_max_lat");
+                while (*p == ' ' || *p == '\t' || *p == '=') {
+                    p++;
+                }
+
+                double val = atof(p);
+                g_maxLat = val;
+                foundMaxLat = true;
+                debug_serial.print("[CFG] g_maxLat = ");
+                debug_serial.println(val, 6);
+            }
+            else if (strncmp(s, "geof_min_lng", strlen("geof_min_lng")) == 0) {
+                char* p = s + strlen("geof_min_lng");
+                while (*p == ' ' || *p == '\t' || *p == '=') {
+                    p++;
+                }
+
+                double val = atof(p);
+                g_minLng = val;
+                foundMinLng = true;
+                debug_serial.print("[CFG] g_minLng = ");
+                debug_serial.println(val, 6);
+            }
+            else if (strncmp(s, "geof_max_lng", strlen("geof_max_lng")) == 0) {
+                char* p = s + strlen("geof_max_lng");
+                while (*p == ' ' || *p == '\t' || *p == '=') {
+                    p++;
+                }
+
+                double val = atof(p);
+                g_maxLng = val;
+                foundMaxLng = true;
+                debug_serial.print("[CFG] g_maxLng = ");
+                debug_serial.println(val, 6);
+            }
+            else if (strncmp(s, "time_zone", strlen("time_zone")) == 0) {
+                int tz;
+                if (sscanf(s, "time_zone %d", &tz) == 1) {
+                    g_timeZoneHours = tz;
+                    debug_serial.print("[CFG] time_zone = ");
+                    debug_serial.println(tz);
+                }
+            }
+            else {
+                // Some other config line
+                debug_serial.println(s);
+            }
+            
       }
       config_file.close();
+
+      // If we found all 4 lines, enable geofence
+      if (foundMinLat && foundMaxLat && foundMinLng && foundMaxLng) {
+          g_enableGeofence = true;
+          debug_serial.println("[CFG] Geofencing is ENABLED (square bounding box).");
+      } else {
+          g_enableGeofence = false;
+          debug_serial.println("[CFG] Geofencing is DISABLED (missing bounding box lines).");
+      }
+
     } else {
       debug_serial.println("No CONFIG.TXT found");
     }
-    config_file.close();
+
     root.close();
     return true;
 }
 
-//***********************************************************
-// CHANGED: createFile()
-//***********************************************************
-void createFile() {
+
+void create_file() {
     if (!card.init(SPI_HALF_SPEED, PIN_SD_SS)) {
         debug_serial.println("initialization failed. Check wiring and card.");
         return false;
@@ -213,14 +292,14 @@ void createFile() {
         debug_serial.println("Card is present.");
     }
 
-     if (!volume.init(card)) {
+    if (!volume.init(card)) {
         debug_serial.println("Could not find FAT16/FAT32 partition.");
         return false;
     }
 
     // Try opening the root directory
     if (!root.openRoot(volume)) {
-        debug_serial.println("[createFile] ERROR: Failed to open root directory.");
+        debug_serial.println("[create_file] ERROR: Failed to open root directory.");
         debug_serial.println("             Make sure SD card is mounted and volume.init() succeeded.");
         return;
     }
@@ -243,13 +322,13 @@ void createFile() {
 
     // Attempt to create the new file
     if (!myFile.open(&root, fileName, O_CREAT | O_WRITE | O_TRUNC)) {
-        debug_serial.print("[createFile] ERROR: Could NOT create file: ");
+        debug_serial.print("[create_file] ERROR: Could NOT create file: ");
         debug_serial.println(fileName);
         debug_serial.println("             Possibly SD permissions/format issue or the file is locked.");
         return;
     }
 
-    debug_serial.print("[createFile] Created new file: ");
+    debug_serial.print("[create_file] Created new file: ");
     debug_serial.println(fileName);
 
     // sample CSV header
@@ -259,15 +338,26 @@ void createFile() {
     root.close();
 }
 
-//***********************************************************
-// CHANGED: writeFile()
-//***********************************************************
 void writeFile(const char *fileName, const char *data) {
     // Try opening the root directory
     if (!root.openRoot(volume)) {
-        debug_serial.println("[writeFile] ERROR: Failed to open root directory.");
-        debug_serial.println("             Make sure volume.init() succeeded and card is still powered.");
-        return;
+        if (!card.init(SPI_HALF_SPEED, PIN_SD_SS)) {
+            debug_serial.println("initialization failed. Check wiring and card.");
+            return false;
+        } else {
+            debug_serial.println("Card is present.");
+        }
+
+        if (!volume.init(card)) {
+            debug_serial.println("Could not find FAT16/FAT32 partition.");
+            return false;
+        }
+        // Try opening the root directory
+        if (!root.openRoot(volume)) {
+            debug_serial.println("[writeFile] ERROR: Failed to open root directory.");
+            debug_serial.println("             Make sure SD card is mounted and volume.init() succeeded.");
+            return;
+        }
     }
 
     // Use O_APPEND to add data at the end of the file
@@ -278,10 +368,10 @@ void writeFile(const char *fileName, const char *data) {
         return;
     }
 
-    myFile.print(data);
+    debug_serial.print("[writeFile] Write at ");
+    debug_serial.print(fileName);
+    myFile.println(data);
     myFile.close();
-    debug_serial.print("[writeFile] Write complete to ");
-    debug_serial.println(fileName);
 
     root.close();
 }
@@ -343,6 +433,7 @@ String get_imu_data() {
 //***********************************************************
 // GPS
 //***********************************************************
+
 String get_gps_data() {
     // Read all bytes currently available on GNSS serial
     while (gnss_serial.available()) {
@@ -354,7 +445,7 @@ String get_gps_data() {
     String timeStr = "";
     String latStr  = "";
     String lonStr  = "";
-
+    double lat = 0, lon = 0;
     if (gps.time.isUpdated()) {
         // Format hh:mm:ss
         char buf[10];
@@ -362,13 +453,36 @@ String get_gps_data() {
         timeStr = String(buf);
     }
     if (gps.location.isUpdated()) {
-        latStr = String(gps.location.lat(), 6);
-        lonStr = String(gps.location.lng(), 6);
+        lat = gps.location.lat();
+        lon = gps.location.lng();
+        latStr = String(lat, 6);
+        lonStr = String(lon, 6);
+        if (insideSquare( lat, lon )) {
+            // send flag to LoRa gateway
+            debug_serial.println( "Inside geofencing" );
+        }
+        else {
+            debug_serial.println( "OUTSIDE!! geofencing" );
+        }
     }
 
     // CSV chunk: "GpsTime,lat,lon"
     String gpsData = timeStr + "," + latStr + "," + lonStr;
     return gpsData;
+}
+
+bool insideSquare(double lat, double lng) {
+    if (!g_enableGeofence) {
+        return false;  // or skip logic
+    }
+    // A point is inside the square if:
+    //   g_minLat <= lat <= g_maxLat
+    //   g_minLng <= lng <= g_maxLng
+    if (lat >= g_minLat && lat <= g_maxLat &&
+        lng >= g_minLng && lng <= g_maxLng) {
+        return true;
+    }
+    return false;
 }
 
 //***********************************************************
@@ -382,7 +496,7 @@ ISR(RTC_CNT_vect)
     g_secondsSinceStart++;
 }
 
-void initRTC()
+void init_RTC()
 {
     RTC.CLKSEL = RTC_CLKSEL_INT32K_gc; 
     RTC.CNT = 0;
@@ -421,7 +535,7 @@ void setup() {
 
     // SD
     SD.begin(PIN_SD_SS);
-    if (!test_sdcard()) {
+    if (!init_sdcard()) {
       debug_serial.println("SD card initialization failed!");
     }
 
@@ -429,10 +543,10 @@ void setup() {
     init_imu();
 
     // Create a new data file
-    createFile();
+    create_file();
 
     // RTC
-    initRTC();
+    init_RTC();
 
     // Power GNSS on (active-low)
     digitalWrite(PIN_EN_GNSS, LOW);
