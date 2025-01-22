@@ -5,6 +5,7 @@
 #   global import
 #
 
+import argparse
 import cv2
 import csv
 import time
@@ -134,7 +135,7 @@ class DataPrepare():
         '''
 
         mark_interval = 1.0   # mark behavior every x seconds
-        speed_factor = 4.0    # 2x speed playback for video
+        speed_factor = 10.0    # 2x speed playback for video
 
         #   get behaviorDict
         if os.path.exists(BehaviorDictFileName):
@@ -154,7 +155,7 @@ class DataPrepare():
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         duration = frame_count / fps
 
-        print(f"Video: {video_path}")
+        print(f"Video: {video_path}")3
         print(f"Video Duration: {duration:.2f} seconds, FPS: {fps}")
         print("Available behaviors:")
         for num, behav in behaviorDict.items():
@@ -169,6 +170,12 @@ class DataPrepare():
 
             while True:
                 if not paused:
+                    if speed_factor > 1:
+                        # skip frames (speed_factor - 1) times
+                        for i in range(int(speed_factor) - 1):
+                            ret, _ = cap.read()
+                            if not ret:
+                                break
                     ret, frame = cap.read()
                     if not ret:
                         print("End of video reached.")
@@ -353,6 +360,44 @@ class DataPrepare():
 #   main
 #
        
+def main():
+    # Initialize the argument parser
+    parser = argparse.ArgumentParser(description="Process folder names and data offset.")
+
+    # Add arguments
+    parser.add_argument(
+        '--folder',
+        type=str,
+        required=True,
+        help="Comma-separated list of folder names (e.g., xxx,yyy,zzz)."
+    )
+    parser.add_argument(
+        '--dataOffset',
+        type=float,
+        required=True,
+        help="Data offset as a float."
+    )
+
+    # Parse arguments
+    args = parser.parse_args()
+
+    # Process the folder argument
+    folderNameList = [folder.strip() for folder in args.folder.split(',')]
+    dataOffset = args.dataOffset
+
+    # Print or use the parsed arguments
+    print("Folder List:", folderNameList)
+    print("Data Offset:", dataOffset)
+
+    for folderName in folderNameList:
+        dp = DataPrepare( folderName=folderName, dataOffset=dataOffset )
+        dp.createAnnotationFile()
+        dp.createMappedData()
+        dp.createWindowedData()
+
+
+if __name__ == "__main__":
+    main()
 
 
 
