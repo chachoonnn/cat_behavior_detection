@@ -1,7 +1,9 @@
 #include "Arduino.h"
+#include "model.h"
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
+#include <LoRa.h>
 #include <avr/sleep.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -33,20 +35,26 @@
 #define PIN_GNSS_TX   PIN_PF1
 
 #define PIN_BAT_PROBE PIN_PD7
+#define LORA_FREQUENCY 434E6  // Set LoRa frequency (match gateway)
+// For your gateway code, these two are important
+#define GATEWAY_ADDRESS  0x00
+#define DEVICE_ADDRESS   0x01
 
+// If you decide to use a new custom packet type:
+#define PKT_TYPE_STRING  0x05
 //***********************************************************
 // Macros
 //***********************************************************
 #define SHORT_BLINK1()  do {              \
-    digitalWrite(PIN_LED1, HIGH);         \
+    digitalWrite(PIN_LED1, LOW);         \
     delay(10);                            \
-    digitalWrite(PIN_LED1, LOW);          \
+    digitalWrite(PIN_LED1, HIGH);          \
 } while (0)
 
 #define SHORT_BLINK2()  do {              \
-    digitalWrite(PIN_LED2, HIGH);         \
+    digitalWrite(PIN_LED2, LOW);         \
     delay(10);                            \
-    digitalWrite(PIN_LED2, LOW);          \
+    digitalWrite(PIN_LED2, HIGH);          \
 } while (0)
 
 //***********************************************************
@@ -70,7 +78,8 @@ char fileName[15];
 bool g_enableGeofence = false;  // if false => skip geofence check
 double g_minLat = 0.0, g_maxLat = 0.0;
 double g_minLng = 0.0, g_maxLng = 0.0;
-
+bool g_gpsFix = false;          // have we ever had a valid fix?
+static int g_gpsWaitCount = 0;
 // For time zone offset
 int g_timeZoneHours = 0;        // e.g. 7 => +7 hours from UTC
 
@@ -82,6 +91,28 @@ uint8_t g_lastHour = 0, g_lastMinute = 0, g_lastSecond = 0;
 // Then we can add that offset to the last known time
 uint32_t g_lastRtcCount = 0;
 
+struct ImuSample {
+  float ax;
+  float ay;
+  float az;
+  float gx;
+  float gy;
+  float gz;
+};
+
+// We want 200 samples for a 3-s window at 40 Hz
+static const int WINDOW_SIZE = 120;
+static const int SLIDING_STEP = 20;  // every 0.5 s at 40 Hz
+
+// Ring buffer to store the most recent 200 samples
+ImuSample ringBuffer[WINDOW_SIZE];
+
+// This points to where the next sample will go
+int ringHead = 0;
+
+// Keep track of how many samples have arrived total (ever).
+uint32_t sampleCounter = 0;
+uint32_t lastPredictionSample = 0;
 //***********************************************************
 // Forward declarations
 //***********************************************************
@@ -102,12 +133,24 @@ ISR(RTC_CNT_vect);
 void init_RTC(void);
 String getUpTimeMillisString(void);
 
+void init_lora();
+void sendLoRaString(const char *msg);
 //***********************************************************
 // Pull-up all pins to reduce power (optional)
 //***********************************************************
 void pullup_all_pins() {
-  // ...
+    for (uint8_t i = 0; i < 8; i++) {
+        //    *((uint8_t *)&PORTA + 0x10 + i) = PORT_PULLUPEN_bm;
+        //    *((uint8_t *)&PORTC + 0x10 + i) = PORT_PULLUPEN_bm;
+        //    *((uint8_t *)&PORTD + 0x10 + i) = PORT_PULLUPEN_bm;
+        //    *((uint8_t *)&PORTF + 0x10 + i) = PORT_PULLUPEN_bm;
+        if ((VPORTA.DIR & (1 << i)) == 0) *((uint8_t *)&PORTA + 0x10 + i) = PORT_PULLUPEN_bm;
+        if ((VPORTC.DIR & (1 << i)) == 0) *((uint8_t *)&PORTC + 0x10 + i) = PORT_PULLUPEN_bm;
+        if ((VPORTD.DIR & (1 << i)) == 0) *((uint8_t *)&PORTD + 0x10 + i) = PORT_PULLUPEN_bm;
+        if ((VPORTF.DIR & (1 << i)) == 0) *((uint8_t *)&PORTF + 0x10 + i) = PORT_PULLUPEN_bm;
+    }
 }
+
 
 //***********************************************************
 // GPIO
@@ -129,6 +172,8 @@ void init_gpio() {
     digitalWrite(PIN_EN_LORA, HIGH);
     digitalWrite(PIN_RF_SS, HIGH);
     digitalWrite(PIN_SD_SS, HIGH);
+    digitalWrite(PIN_LED1, LOW);
+    digitalWrite(PIN_LED2, LOW);
 }
 
 //***********************************************************
@@ -280,6 +325,8 @@ bool init_sdcard() {
     }
 
     root.close();
+    // digitalWrite(PIN_EN_SD, HIGH);
+
     return true;
 }
 
@@ -343,6 +390,8 @@ void writeFile(const char *fileName, const char *data) {
     if (!root.openRoot(volume)) {
         if (!card.init(SPI_HALF_SPEED, PIN_SD_SS)) {
             debug_serial.println("initialization failed. Check wiring and card.");
+            SHORT_BLINK2();
+
             return false;
         } else {
             debug_serial.println("Card is present.");
@@ -350,12 +399,16 @@ void writeFile(const char *fileName, const char *data) {
 
         if (!volume.init(card)) {
             debug_serial.println("Could not find FAT16/FAT32 partition.");
+            SHORT_BLINK2();
+
             return false;
         }
         // Try opening the root directory
         if (!root.openRoot(volume)) {
             debug_serial.println("[writeFile] ERROR: Failed to open root directory.");
             debug_serial.println("             Make sure SD card is mounted and volume.init() succeeded.");
+            SHORT_BLINK2();
+
             return;
         }
     }
@@ -365,6 +418,7 @@ void writeFile(const char *fileName, const char *data) {
         debug_serial.print("[writeFile] ERROR: Could NOT open file for append: ");
         debug_serial.println(fileName);
         debug_serial.println("             Possibly SD is locked, missing, or the file is in use.");
+        SHORT_BLINK2();
         return;
     }
 
@@ -372,6 +426,7 @@ void writeFile(const char *fileName, const char *data) {
     debug_serial.print(fileName);
     myFile.println(data);
     myFile.close();
+    SHORT_BLINK1();
 
     root.close();
 }
@@ -523,99 +578,282 @@ String getUpTimeMillisString() {
 }
 
 //***********************************************************
-// GET DATA FROM IMU INTO SD CARD
+// behavior classification
 //***********************************************************
+void computeWindowFeatures(float* buf, int length, 
+                           float &meanVal, float &stdVal, float &minVal, float &maxVal) {
+  if (length <= 0) {
+    meanVal = stdVal = minVal = maxVal = 0.0f;
+    return;
+  }
 
-// void setup() {
-void setup1() {
+  // Compute mean
+  float sum = 0.0f;
+  minVal = buf[0];
+  maxVal = buf[0];
+  for (int i = 0; i < length; i++) {
+    sum += buf[i];
+    if (buf[i] < minVal) minVal = buf[i];
+    if (buf[i] > maxVal) maxVal = buf[i];
+  }
+  meanVal = sum / length;
+
+  // Compute std
+  float sumSq = 0.0f;
+  for (int i = 0; i < length; i++) {
+    float diff = buf[i] - meanVal;
+    sumSq += diff * diff;
+  }
+  stdVal = sqrt(sumSq / length);
+}
+
+extern void score(double * input, double * output); // from your generated score.c
+
+void classifyLatestWindow() 
+{
+    // 1) Reconstruct the 200 samples in chronological order
+    //    The most recent sample is ringHead - 1
+    //    The oldest is ringHead (modded)
+    ImuSample windowData[WINDOW_SIZE];
+
+    // We'll figure out the index of the oldest sample
+    // Because ringHead points to where the *next* sample goes
+    // The oldest sample is ringHead itself (if we have 200 fully).
+    int startIndex = ringHead; 
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+        int bufIndex = (startIndex + i) % WINDOW_SIZE;
+        windowData[i] = ringBuffer[bufIndex];
+    }
+
+    // 2) Now compute your features from windowData[0..199]
+    //    Make arrays for each axis so you can compute mean/std/min/max easily
+    float axArray[WINDOW_SIZE], ayArray[WINDOW_SIZE], azArray[WINDOW_SIZE];
+    float gxArray[WINDOW_SIZE], gyArray[WINDOW_SIZE], gzArray[WINDOW_SIZE];
+
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+        axArray[i] = windowData[i].ax;
+        ayArray[i] = windowData[i].ay;
+        azArray[i] = windowData[i].az;
+        gxArray[i] = windowData[i].gx;
+        gyArray[i] = windowData[i].gy;
+        gzArray[i] = windowData[i].gz;
+    }
+    float axMean, axStd, axMin, axMax;
+    computeWindowFeatures(axArray, WINDOW_SIZE, axMean, axStd, axMin, axMax);
+
+    float ayMean, ayStd, ayMin, ayMax;
+    computeWindowFeatures(ayArray, WINDOW_SIZE, ayMean, ayStd, ayMin, ayMax);
+
+    float azMean, azStd, azMin, azMax;
+    computeWindowFeatures(azArray, WINDOW_SIZE, azMean, azStd, azMin, azMax);
+
+    float gxMean, gxStd, gxMin, gxMax;
+    computeWindowFeatures(gxArray, WINDOW_SIZE, gxMean, gxStd, gxMin, gxMax);
+
+    float gyMean, gyStd, gyMin, gyMax;
+    computeWindowFeatures(gyArray, WINDOW_SIZE, gyMean, gyStd, gyMin, gyMax);
+
+    float gzMean, gzStd, gzMin, gzMax;
+    computeWindowFeatures(gzArray, WINDOW_SIZE, gzMean, gzStd, gzMin, gzMax);
+  // 3) Create the 24D input array in same order as your Python code
+  //    Then do the scaling: scaled_value = (value - mean[i]) / std[i]
+
+    double input[24];
+    input[0]  = axMean;
+    input[1]  = axStd;
+    input[2]  = axMin;
+    input[3]  = axMax;
+    input[4]  = ayMean;
+    input[5]  = ayStd;
+    input[6]  = ayMin;
+    input[7]  = ayMax;
+    input[8]  = azMean;
+    input[9]  = azStd;
+    input[10] = azMin;
+    input[11] = azMax;
+    input[12] = gxMean;
+    input[13] = gxStd;
+    input[14] = gxMin;
+    input[15] = gxMax;
+    input[16] = gyMean;
+    input[17] = gyStd;
+    input[18] = gyMin;
+    input[19] = gyMax;
+    input[20] = gzMean;
+    input[21] = gzStd;
+    input[22] = gzMin;
+    input[23] = gzMax;
+
+  // scale them with your hardcoded means/stds
+    // const char* behaviors[3] = {"lay down", "stand", "sit"};    
+    const char* behaviors[3] = {"lay down","sit", "stand", };    
+    // const char* behaviors[3] = { "stand", "sit", "lay down"};    
+    // const char* behaviors[3] = { "stand", "sit", "lay down"};    
+    static const double means[24] = {
+        6.37140849e-03 , 7.61203792e-02, -9.89806174e-02 , 1.12806892e-01,
+        -7.14863176e-01 , 8.60156097e-02, -8.31035535e-01 ,-5.95821967e-01,
+        5.43291430e-01 , 1.05850135e-01 , 3.98492462e-01 , 6.87936109e-01,
+        6.43611471e-01 , 2.29076341e+01, -3.12973169e+01 , 3.29208668e+01,
+        -6.22653624e-01 , 2.35146466e+01, -3.37848403e+01 , 3.23195729e+01,
+        -4.52030123e-02 , 2.24754662e+01, -3.10248134e+01 , 3.21552028e+01
+    };
+
+    static const double stds[24] = {
+        0.18892042  ,0.09119041  ,0.22929603 , 0.24994066  ,0.2372586   ,0.11192168,
+        0.28942015  ,0.29364816  ,0.354913   , 0.12425447  ,0.40079765  ,0.39388221,
+        19.71975359 ,29.5395564  ,47.40253715, 50.88442037 ,18.83502771 ,25.79482671,
+        46.67216502 ,49.13733964 ,17.90931593, 25.61447513 ,37.93129893 ,50.43662942,
+    };
+
+
+    for (int i = 0; i < 24; i++) {
+        // scaled_value = (value - mean[i]) / std[i]
+        input[i] = (input[i] - means[i]) / stds[i];
+    }
+    // 4) Call the model
+    double output[3];
+    score(input, output);
+
+    // 5) Find which class is best
+    int bestClass = 0;
+    double bestVal = output[0];
+    for (int i = 1; i < 3; i++) {
+        if (output[i] > bestVal) {
+        bestVal = output[i];
+        bestClass = i;
+        }
+    }
+    const char* predicted = behaviors[bestClass];
+
+    // Print or log the result
+    // Serial.print("Predicted Behavior = ");
+    // Serial.println(predicted);
+    if (predicted == "stand") {
+        digitalWrite(PIN_LED1, LOW);
+        digitalWrite(PIN_LED2, HIGH);
+    }
+    else if (predicted == "sit") {
+        digitalWrite(PIN_LED1, LOW);
+        digitalWrite(PIN_LED2, LOW);
+    }
+    else if (predicted == "lay down") {
+        digitalWrite(PIN_LED1, HIGH);
+        digitalWrite(PIN_LED2, LOW);
+    }
+
+    // ... you can store or send the result over LoRa, etc.
+    sendLoRaString(predicted);
+}
+//***********************************************************
+// LoRa
+//***********************************************************
+void init_lora() {
+    Serial.println("innit LoRa...");
+    pinMode(PIN_EN_LORA, OUTPUT);
+    digitalWrite(PIN_EN_LORA, LOW);
+    delay(100);
+    LoRa.setPins(PIN_RF_SS, PIN_RF_RST, PIN_RF_DIO1);
+    if (!LoRa.begin(434E6)) {
+        Serial.println("LoRa init failed!");
+        while (true) {
+            SHORT_BLINK1();
+            delay(250);
+        }
+    }
+    LoRa.setSpreadingFactor(12);
+    LoRa.setSignalBandwidth(125E3);
+    LoRa.setCodingRate4(8);
+    LoRa.setTxPower(15);
+    LoRa.beginPacket();
+    LoRa.print("START: Smart Cat Collar");
+    LoRa.endPacket();
+    Serial.println("LoRa init Done");
+}
+
+void sendLoRaString(const char *msg) {
+    Serial.print("sending... ");Serial.println(msg);
+    LoRa.beginPacket();
+    LoRa.print(msg);
+    LoRa.endPacket();
+    Serial.print("Sent: ");Serial.println(msg);
+}
+//***********************************************************
+// Main
+//***********************************************************
+void setup() {
+// void setup1() {
     pullup_all_pins();
     init_gpio();
     debug_serial.begin(115200);
     delay(1000);
 
     debug_serial.println("System starting...");
-    Wire.swap(0);
-    Wire.begin();
+    // Wire.swap(0);
+    // Wire.begin();
     gnss_serial.begin(9600);
     SPI.swap(SPI1_SWAP_DEFAULT);
+    delay(1000);
+    init_lora();
 
 
-    // SD
-    SD.begin(PIN_SD_SS);
-    if (!init_sdcard()) {
-      debug_serial.println("SD card initialization failed!");
-    }
+    // // SD
+    // SD.begin(PIN_SD_SS);
+    // if (!init_sdcard()) {
+    //   debug_serial.println("SD card initialization failed!");
+    // }
 
     // IMU
     init_imu();
 
-    // Create a new data file
-    create_file();
-
     // RTC
-    init_RTC();
-}
-
-// void loop() {
-void loop1() {
-
-    // 1) Acquire IMU data (or blank if not available)
-    String imuData = get_imu_data();
-
-    // 2) Get device uptime in milliseconds (as string)
-    String uptimeMs = getUpTimeMillisString();
-
-    // 3) Build CSV line (adding 3 empty columns for MagX,MagY,MagZ)
-    String csvLine = uptimeMs + "," + 
-                     imuData + "," +
-                     ",," +   // blank placeholders for Mag
-                     "\r\n";
-
-    // 4) Append to file named "data_1.txt" or "data_2.txt", etc.
-    writeFile(fileName, csvLine.c_str());
-
-    debug_serial.print("Data: ");
-    debug_serial.println(csvLine);
-
-    delay(500);
-}
-
-//***********************************************************
-// READ GPS DATA
-//***********************************************************
-
-void setup() {
-// void setup2() {
-    init_gpio();
-
-    // Start serial for debug
-    debug_serial.begin(115200);
-    delay(1000);
-    debug_serial.println("GPS Starting...");
-
-    // If your board supports Wire.swap(0) or similar, do it if needed
-    // Wire.swap(0);
-    // Wire.begin();
-
-    // Initialize GNSS Serial 
-    // (check your board's docs for the correct pins or usage of Serial2)
-    gnss_serial.begin(9600);
-
-    // Blink once to show we're alive
-    SHORT_BLINK1();
-
-    // Power GNSS on (active-low)
+    // init_RTC();
     digitalWrite(PIN_EN_GNSS, LOW);
 
     g_enableGeofence = true;
-    g_minLat = 13.0;
-    g_maxLat = 15.0;
-    g_minLng = 99.0;
-    g_maxLng = 101.0;
+    g_minLat = 13.9229;
+    g_maxLat = 13.923695;
+    g_minLng = 100.57059;
+    g_maxLng = 100.57145;
+
+    ringHead = 0;
+    sampleCounter = 0;
+    lastPredictionSample = 0;
 }
 
 void loop() {
-// void loop2() {
+    // 1) Read one IMU sample
+    float ax = 0, ay = 0, az = 0;
+    float gx = 0, gy = 0, gz = 0;
+    if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+        IMU.readAcceleration(ax, ay, az);
+        IMU.readGyroscope(gx, gy, gz);
+    }
+
+    // 2) Store in ring buffer
+    ringBuffer[ringHead].ax = ax;
+    ringBuffer[ringHead].ay = ay;
+    ringBuffer[ringHead].az = az;
+    ringBuffer[ringHead].gx = gx;
+    ringBuffer[ringHead].gy = gy;
+    ringBuffer[ringHead].gz = gz;
+
+    // Move ringHead forward by 1 (wrap around with modulo)
+    ringHead = (ringHead + 1) % WINDOW_SIZE;
+
+    // 3) Increment sampleCounter
+    sampleCounter++;
+
+    // 4) Check if we have at least one full window of 200 samples
+    //    and if 25 new samples have arrived since last classification
+    if ( (sampleCounter >= WINDOW_SIZE) 
+        && ((sampleCounter - lastPredictionSample) >= SLIDING_STEP) )
+    {
+        // We do classification on the LAST 200 samples in the ring buffer
+        classifyLatestWindow();
+        // Update lastPredictionSample
+        lastPredictionSample = sampleCounter;
+        g_gpsWaitCount++;
+    }
     // 1) Continuously read from GNSS serial
     while (gnss_serial.available()) {
         char c = gnss_serial.read();
@@ -624,36 +862,41 @@ void loop() {
 
     // 2) If we have a new updated location/time, print it
     //    (TinyGPS++ sets these flags when a new full NMEA sentence has been parsed)
+    
     if (gps.location.isUpdated()) {
+        g_gpsFix = true;
         debug_serial.println();
         double lat = gps.location.lat();
         double lng = gps.location.lng();
+        char latStr[15];
+        char lngStr[15];
+        char geofencingStr[15];
+        dtostrf(lat, 10, 6, latStr); 
+        dtostrf(lng, 10, 6, lngStr);
         debug_serial.print("Lat: ");
         debug_serial.print(lat, 6);
         debug_serial.print("  Lon: ");
         debug_serial.print(lng, 6);
 
-        // Print time if available
-        if (gps.time.isValid()) {
-            debug_serial.print("  Time (UTC): ");
-            debug_serial.print(gps.time.hour());
-            debug_serial.print(":");
-            debug_serial.print(gps.time.minute());
-            debug_serial.print(":");
-            debug_serial.println(gps.time.second());
-        }
+        char gpsData[50];
+        // debug_serial.println( gpsData );
+        // Send GPS data over LoRa
         if (insideSquare( lat, lng )) {
             // send flag to LoRa gateway
-            debug_serial.println( "Inside geofencing" );
+            // debug_serial.println( "Inside geofencing" );
+            strcpy(geofencingStr, "inside");
         }
         else {
-            debug_serial.println( "OUTSIDE!! geofencing" );
+            // debug_serial.println( "OUTSIDE!! geofencing" );
+            strcpy(geofencingStr, "outside");
         }
-
-        // Blink LED2 to indicate we got new data
-        SHORT_BLINK2();
+        // sprintf(gpsData, "Lat: %s, Lon: %s, Geofencing: %s", latStr, lngStr, geofencingStr);
+        sprintf(gpsData, "Lat: %s, Lon: %s, Geofencing: %s", latStr, lngStr, geofencingStr);
+        if (g_gpsWaitCount > 10) {
+            sendLoRaString( gpsData );
+            g_gpsWaitCount = 0;
+        }
     }
-
-    // Optional small delay
-    delay(100);
+  // ... any other loop code ...
+  delay(25); //40 hz
 }
