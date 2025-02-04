@@ -39,7 +39,7 @@ SdFile root;
 
 /************************************************************
  * Enable pull-up on all pins to lower power
- * taken from https://www.avrfreaks.net/comment/3209046#comment-3209046
+ * taken from   
  */
 void pullup_all_pins() {
     //for (uint8_t i = 0; i < 8; i++) {
